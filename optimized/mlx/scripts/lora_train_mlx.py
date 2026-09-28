@@ -625,6 +625,17 @@ def main():
             exclude=lora_config.get("exclude"),
             extra_config={"step": int(step), "base_model": base_model})
         t_a = time.time()
+        # Hand MLX's buffer cache back before loading a second DiT: after
+        # training steps it holds 2.4-3.1 GB (sm-music, crop 64) of freed
+        # activation buffers that the ARC weights mostly can't reuse. Measured
+        # no slower (ARC load 4.4-6.9 s with, 5.6-15.7 s without), and on a
+        # 16 GB Mac that's the headroom a medium ARC load runs out of.
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+        # Announce before the load: it holds a second DiT in memory and merges
+        # the LoRA in fp32, so it is a likely place to run out of memory, and
+        # underfit's failure report reads this line to say so.
+        print(f"  loading ARC model ({args.dit}) + merging LoRA …", flush=True)
         try:
             arc_dit = mod.load_dit(arc_path, T_lat=crop_len, dtype=mx.float16,
                                    compile_=False, lora_paths=[str(tmp_ckpt)],
