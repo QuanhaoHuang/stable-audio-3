@@ -7,18 +7,25 @@ the 10 rungs share one copy of the weights, and dispatches by rung -> peak RAM i
 largest rung actually used, not the sum.
 
 The 7 BAKED inputs match export_dit.DiTBaked.forward (args_0..6, in this order):
-    x[1,256,R]  t[1]  t5_hidden[1,256,768]  t5_mask[1,256]  seconds[1]  local_add_cond[1,257,R]
+    x[1,256,R]  gc[1,9216]  t5_hidden[1,256,768]  t5_mask[1,256]  seconds[1]  local_add_cond[1,257,R]
     attn_mask[1,1,1,MEM+R]   (0 for the MEM+L valid keys, -1e9 for the R-L pad keys)
-The conditioner (T5 padding + seconds) is baked in-graph. Batch is baked to 1, so CFG runs as a SEQUENTIAL
+gc (the adaLN global = global_cond_embedder(to_global_embed(seconds)+timestep(t))) is computed OUTSIDE the
+rung — by a 'gcond' signature bundled in the SAME .tflite (one shipped file; a sibling gcond.tflite is a
+legacy fallback) — and fed in per step. This keeps the 24x-inlined global_cond_embedder FC OUT of the int8
+rung, where under the XNNPACK weight cache it corrupts multi-rung int8 (see export_dit / memory
+sa3-rung-weightcache-int8-bug). The conditioner (T5 padding + seconds) is baked in-graph. Batch is
+baked to 1, so CFG runs as a SEQUENTIAL
 dual-pass (cond + uncond), exactly like the static-batch=1 TensorRT engine. Interface mirrors BakedDiT so
 sa3_tflite.main() can swap it in: __call__(x, t, cross, gcond) -> v (or cfg-guided v)."""
 from __future__ import annotations
+import os
 import numpy as np
 
 MEM = 64               # memory/register tokens prepended in-graph (must match export_dit.MEM)
 COND_TOKENS = 256
 COND_DIM = 768
 LATENT_CH = 256
+GCE_OUT = 9216         # adaLN global gc dim (6*embed_dim); computed by gcond.tflite, fed as a rung input
 
 
 class RungDiT:
@@ -28,16 +35,38 @@ class RungDiT:
 
     def __init__(self, path, L, t5_hidden, t5_mask, seconds, threads=8, cfg=1.0, apg=1.0,
                  null_hidden=None, null_mask=None, local_add_cond=None,
-                 weight_cache_path="auto", cfg_fn=None, **_ignored):
+                 weight_cache_path="auto", cfg_fn=None, xnnpack_flags=None, kernel_mode=None,
+                 enable_ynnpack=False, gcond_path="auto", **_ignored):
         from ai_edge_litert.compiled_model import CompiledModel, Options
         from ai_edge_litert.cpu_options import CpuOptions
+        from ai_edge_litert.interpreter import Interpreter
         path = str(path)
         wc = (path + ".xnnwc") if weight_cache_path == "auto" else weight_cache_path
-        self.m = CompiledModel.from_file(path, options=Options(cpu_options=CpuOptions(
-            num_threads=int(threads), xnnpack_weight_cache_path=str(wc) if wc else "")))
+        copts = dict(num_threads=int(threads), xnnpack_weight_cache_path=str(wc) if wc else "")
+        if xnnpack_flags is not None: copts["xnnpack_flags"] = xnnpack_flags
+        if kernel_mode is not None: copts["kernel_mode"] = kernel_mode
+        if enable_ynnpack: copts["enable_ynnpack"] = True
+        self.m = CompiledModel.from_file(path, options=Options(cpu_options=CpuOptions(**copts)))
         # discover rung sizes from the file's s<N> signatures (any rung set just works)
         keys = {self.m.get_signature_by_index(i)["key"]: i for i in range(self.m.get_num_signatures())}
         self.sig = {int(k[1:]): v for k, v in keys.items() if k.startswith("s") and k[1:].isdigit()}
+        # gc[1,9216] is computed OUTSIDE the rung (keeps the global_cond_embedder FC out of the int8 rung —
+        # the XNNPACK-cache corruption trigger). It rides in the SAME .tflite as a 'gcond' signature (one
+        # shipped file) and runs through THIS CompiledModel, which allocates per-signature on the flat-RAM
+        # cache path. ⚠ do NOT open a plain Interpreter on the whole multi-rung file to reach it — that
+        # allocates EVERY rung's arena (~18 GB). Legacy fallback (no 'gcond' sig): a sibling gcond.tflite.
+        if "gcond" in keys:
+            self._gcond_si = keys["gcond"]
+            self._gc_inb = self.m.create_input_buffers(self._gcond_si)   # [0]=seconds, [1]=t (export arg order)
+            self._gc_outb = self.m.create_output_buffers(self._gcond_si)
+            self._gc_run = None
+        else:
+            sib = os.path.join(os.path.dirname(path), "gcond.tflite") if gcond_path == "auto" else str(gcond_path)
+            self._gc_hold = Interpreter(model_path=sib, num_threads=int(threads))
+            self._gc_run = self._gc_hold.get_signature_runner()
+            self._gc_in = sorted(self._gc_run.get_input_details())
+            self._gc_out = next(iter(self._gc_run.get_output_details()))
+        self._gc_cache = {}
         if not self.sig:
             raise ValueError(f"{path}: no s<N> rung signatures found")
         self.sizes = sorted(self.sig)
@@ -51,16 +80,18 @@ class RungDiT:
     def _input_slots(self, path):
         """Map each of the 7 baked inputs to its CompiledModel buffer position. create_input_buffers()
         follows the SUBGRAPH inputs order == Interpreter.get_input_details() RAW order (NOT the signature
-        alias order args_0..6) — validated max|Δ|=0 vs a name-fed run. Identify each by shape (5 unique);
-        t vs seconds (both rank-1) split by tensor-name order (args_1=t < args_4=seconds). All rungs share
-        one export graph so subgraph 0's order holds for every signature; _write re-checks via shape."""
+        alias order args_0..6) — validated max|Δ|=0 vs a name-fed run. Identify each by shape: the two rank-2
+        inputs split by width (gc[1,9216] vs t5m[1,256]); seconds is the only rank-1 input (t is gone — it is
+        folded into gc by gcond.tflite). All rungs share one export graph so subgraph 0's order holds."""
         from ai_edge_litert.interpreter import Interpreter
         det = Interpreter(model_path=path).get_input_details()   # raw list order == buffer order
-        slots, rank1 = {}, []
+        slots = {}
         for j, d in enumerate(det):
             shp = [int(s) for s in d["shape"]]
             if len(shp) == 4:
                 slots["am"] = j
+            elif len(shp) == 2 and shp[1] == GCE_OUT:
+                slots["gc"] = j
             elif len(shp) == 2:
                 slots["t5m"] = j
             elif len(shp) == 3 and shp[1] == 257:
@@ -70,11 +101,8 @@ class RungDiT:
             elif len(shp) == 3 and shp[1] == LATENT_CH:
                 slots["x"] = j
             elif len(shp) == 1:
-                rank1.append((d["name"], j))
-        rank1.sort()                                      # args_1=t before args_4=seconds
-        if len(rank1) == 2:
-            slots["t"], slots["sec"] = rank1[0][1], rank1[1][1]
-        missing = {"x", "t", "t5h", "t5m", "sec", "lac", "am"} - set(slots)
+                slots["sec"] = j
+        missing = {"x", "gc", "t5h", "t5m", "sec", "lac", "am"} - set(slots)
         if missing:
             raise ValueError(f"{path}: could not map DiT inputs {missing} "
                              f"(shapes={[[int(s) for s in d['shape']] for d in det]})")
@@ -105,6 +133,7 @@ class RungDiT:
         self.null_h = None if null_hidden is None else self._pad_t5(null_hidden)
         self.null_m = None if null_mask is None else null_mask.astype(np.float32).reshape(1, COND_TOKENS)
         # seconds + local_add_cond + attn_mask are constant across steps AND cfg branches -> resident.
+        self.seconds = float(seconds); self._gc_cache = {}    # seconds drives gc (per-step); invalidate cache
         sec = np.array([np.float32(seconds)], np.float32)
         lac = (np.zeros((1, 257, self.R), np.float32) if local_add_cond is None
                else self._pad_len(local_add_cond.astype(np.float32), 257))
@@ -131,10 +160,28 @@ class RungDiT:
     def _write(self, name, arr):
         self.inb[self._slots[name]].write(np.ascontiguousarray(arr, np.float32))
 
+    def _compute_gc(self, t):
+        """gc[1,9216] = gcond.tflite(seconds, t), cached by t. seconds is fixed per render and the global
+        adaLN cond is seconds+timestep only (independent of the text), so the cond & uncond CFG passes share
+        one gc -> one gcond invoke per diffusion step."""
+        key = round(float(t), 7)
+        gc = self._gc_cache.get(key)
+        if gc is None:
+            sec = np.array([np.float32(self.seconds)], np.float32); tt = np.array([np.float32(t)], np.float32)
+            if self._gc_run is None:                                 # 'gcond' signature on self.m (flat RAM)
+                self._gc_inb[0].write(np.ascontiguousarray(sec)); self._gc_inb[1].write(np.ascontiguousarray(tt))
+                self.m.run_by_index(self._gcond_si, self._gc_inb, self._gc_outb)
+                gc = np.asarray(self._gc_outb[0].read(GCE_OUT, np.float32)).reshape(1, GCE_OUT).astype(np.float32)
+            else:                                                    # sibling gcond.tflite SignatureRunner
+                out = self._gc_run(**{self._gc_in[0]: sec, self._gc_in[1]: tt})
+                gc = np.asarray(out[self._gc_out]).reshape(1, GCE_OUT).astype(np.float32)
+            self._gc_cache[key] = gc
+        return gc
+
     def _fwd(self, x, t, t5h=None, t5m=None):
         """One batch=1 forward on the active rung. x is [1,256,L] (padded to R); returns v [1,256,L]."""
         self._write("x", self._pad_len(x.astype(np.float32), LATENT_CH))
-        self._write("t", np.array([np.float32(t)], np.float32))
+        self._write("gc", self._compute_gc(t))            # adaLN global (gcond.tflite); replaces the t input
         if t5h is not None:                               # CFG branches rebind t5h/t5m per pass
             self._write("t5h", t5h); self._write("t5m", t5m)
         self.m.run_by_index(self.si, self.inb, self.outb)

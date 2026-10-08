@@ -51,7 +51,18 @@ PY_EXPORT=/path/to/export-env/bin/python DIT_JOBS=6 bash build_dit.sh
 - **DiT** rungs `{8,192,416,704,1056,1496,2040,2824,3536,4096}` (latents). A render of real length L runs on
   the SMALLEST rung R ≥ L in ONE forward, with the (R−L) pad KEYS masked out of self-attention — so the
   result is EXACT, not tiled. Merged weight-shared, peak RAM is the high-water mark of the largest rung
-  used, flat across length (the old varlen graph materialized `[heads,S,S]` and blew up at long L).
+  used, flat across length (the old varlen graph materialized `[heads,S,S]` and blew up at long L —
+  ~40 GB @ L=4096 vs the rung's ~3.8 GB, a 10× RAM cut).
+- **DiT global-cond preamble (the `gcond` signature).** The per-step adaLN global vector `gc[1,9216]` =
+  `global_cond_embedder(to_global_embed(seconds) + timestep(t))` is computed OUTSIDE the rung graph and fed
+  into the rung as an input, instead of living inside it. This is REQUIRED for the int8 rung: ai_edge_torch
+  inlines that `global_cond_embedder` FC across all 24 blocks, and inside the merged int8 ladder under the
+  XNNPACK weight cache the shared packed FC is mis-reused across rung subgraphs → corrupt output (~6 dB).
+  Pulling it out is numerically bit-exact and keeps the rung cache-safe (999 dB cache vs no-cache). It is
+  built as a tiny fp32 `gcond.tflite` and then FOLDED INTO each ladder as a separate `gcond` signature (via
+  `SA3_MERGE_EXTRA`), so only `dit_{fp32,w8a8}.tflite` ship — one self-contained file each. It is a single
+  non-shared subgraph, so it is cache-safe. The runtime (`rung_dit.py`) runs the `gcond` signature once per
+  diffusion step (~0.5 ms, cached by t; shared across the CFG cond/uncond passes) and feeds `gc`.
 - **Precision tiers.** SAME codec: `w8a8` (default, quality-free on the round-trip) + `fp32`. DiT:
   `fp32` (bit-exact reference, the current default) + `w8a8` (the speed tier that supersedes the old
   published `w8a8-dyn`; int8 on the DiT is NOT bit-identical — the distilled few-step sampler is chaotic —
@@ -65,11 +76,13 @@ extract/               4 SAME weight extractors (ckpt -> npz)
 torch_defs/            checkpoint-faithful SAME torch defs + windowed_decoder (O(S) attention) + limiter
 export/                torch -> fixed-size tflite rung:
                          export_windowed_param.py / export_enc_windowed.py / export_same_s_fixed.py  (SAME)
-                         export_dit.py            (DiT — loads stable_audio_3.models.dit + the ARC ckpt)
+                         export_dit.py            (DiT — loads stable_audio_3.models.dit + the ARC ckpt;
+                                                   `--gcond` exports the global-cond preamble gcond.tflite)
 quant_merge/           quant_one (fp32->w8a8) + merge_rungs_generic (fixed rungs -> one weight-shared file)
 tfl_surgery.py         flatbuffer helper used by the merge
 verify_final.py        structural check of the built files (runtime env) — SAME enc/dec + DiT rungs
-build_dit.sh           DiT-only orchestrator (export -> quant -> merge)
+build_dit.sh           DiT-only orchestrator (export rungs + gcond -> quant -> merge, gcond folded in
+                       as the 'gcond' signature via SA3_MERGE_EXTRA so each ladder is one file)
 build_all.sh           top-level orchestrator (SAME-AE + DiT)
 ```
 Quality (DiT renders / AE round-trip vs ground-truth audio) is a separate check — the ear is the gate.

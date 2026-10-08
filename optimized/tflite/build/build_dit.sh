@@ -41,6 +41,14 @@ done
 [ "$fail" = 0 ] || { echo "DiT export stage FAILED — see $WORK/dit_export_*.log"; exit 1; }
 echo "   all $(echo $DIT_LADDER | wc -w) rungs exported + tflite==torch OK"
 
+echo "== DiT 1b. export gcond.tflite (global-cond preamble: (seconds,t)->gc[1,9216]) =="
+# gc is computed OUTSIDE the rung and fed per step — keeps the 24x-inlined global_cond_embedder FC out of the
+# int8 rung, where under the XNNPACK weight cache it corrupts multi-rung int8 (memory sa3-rung-weightcache-int8-bug).
+$PY_EXPORT "$HERE/export/export_dit.py" --gcond > "$WORK/dit_export_gcond.log" 2>&1
+grep -qE "EXPORTED gcond .* OK"    "$WORK/dit_export_gcond.log" || { echo "!! gcond export failed"; cat "$WORK/dit_export_gcond.log"; exit 1; }
+grep -qE "EXPORTED gcond .* CHECK" "$WORK/dit_export_gcond.log" && { echo "!! gcond FAILED tflite==torch"; exit 1; }
+echo "   gcond.tflite exported + tflite==torch OK (folded into the merged ladders below as the 'gcond' signature)"
+
 echo "== DiT 2. quantize rungs -> w8a8 (dynamic_wi8_afp32) =="
 for R in $DIT_LADDER; do
   $PY_EXPORT "$HERE/quant_merge/quant_one.py" "$WORK/dit_fp32_$R.tflite" "$WORK/dit_fp32_${R}_w8a8.tflite"
@@ -48,6 +56,7 @@ done
 
 echo "== DiT 3. merge rungs -> sa3-m/dit_{fp32,w8a8}.tflite (weight-dedup, N signatures) =="
 DL="$(csv $DIT_LADDER)"
-$PY_EXPORT "$M" "dit_fp32_" ""      "sa3-m/dit_fp32.tflite" "$DL"
-$PY_EXPORT "$M" "dit_fp32_" "_w8a8" "sa3-m/dit_w8a8.tflite" "$DL"
-echo "== DiT DONE: $WORK/sa3-m/dit_fp32.tflite + dit_w8a8.tflite =="
+# SA3_MERGE_EXTRA folds gcond.tflite in as a 'gcond' signature so each ladder is ONE self-contained file.
+SA3_MERGE_EXTRA="gcond:gcond.tflite" $PY_EXPORT "$M" "dit_fp32_" ""      "sa3-m/dit_fp32.tflite" "$DL"
+SA3_MERGE_EXTRA="gcond:gcond.tflite" $PY_EXPORT "$M" "dit_fp32_" "_w8a8" "sa3-m/dit_w8a8.tflite" "$DL"
+echo "== DiT DONE: $WORK/sa3-m/dit_fp32.tflite + dit_w8a8.tflite (each with s<R> rungs + a 'gcond' signature) =="

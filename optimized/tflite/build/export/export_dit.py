@@ -12,6 +12,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""; os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3
 import torch, torch.nn as nn, torch.nn.functional as F
 
 MEM = 64
+GCE_OUT = 9216       # global_cond_embedder output = 6 * embed_dim (6*1536 for medium); the adaLN global gc
 _ADD_MASK = [None]   # the rung's ADDITIVE self-attn key mask [B,1,1,S] (0 valid / -1e9 pad); set per forward
 
 def patch_attention_for_export(debug=False):
@@ -140,9 +141,53 @@ def load_model():
     print(f"sec load: {len(sec_sd)} tensors, missing={len(ms.missing_keys)} unexpected={len(ms.unexpected_keys)}", flush=True)
     return dit, seccond, pad.float()
 
+class GlobalCondBaked(nn.Module):
+    """Computes the DiT's adaLN global vector gc[1,9216] = global_cond_embedder(to_global_embed(seconds_embed)
+    + timestep_embed(t)), exported as a SEPARATE small fp32 tflite. This keeps the 24x-inlined (M=1 [9216,1536])
+    global_cond_embedder FC OUT of the int8 rung graph — inside it, under the XNNPACK weight cache, that shared
+    FC corrupts multi-rung int8 (memory sa3-rung-weightcache-int8-bug). The runtime runs this per diffusion step
+    and feeds gc into the rung. Mirrors dit._forward lines 200-245 + transformer.py:1211 exactly. Captures the
+    submodules by reference at construction so a later apply_gce_outside(dit) mutation can't disturb it."""
+    def __init__(self, dit, seccond):
+        super().__init__()
+        self.seccond = seccond
+        self.to_global_embed = dit.to_global_embed            # 768 -> 1536 -> 1536
+        self.gce = dit.transformer.global_cond_embedder       # 1536 -> 1536 -> 9216 (the trigger FC)
+        self.to_timestep_embed = dit.to_timestep_embed
+        self.timestep_features = dit.timestep_features
+        self._logsnr = dit._t_to_logsnr_cond                  # class-patched method (no clamp)
+        self.use_logsnr = dit.timestep_features_logsnr
+
+    def _seconds_embed(self, seconds):
+        c = self.seccond
+        s = (seconds - c.min_val) / (c.max_val - c.min_val)
+        emb = c.embedder(s)
+        return emb if emb.dim() == 3 else emb.unsqueeze(1)    # [B,1,768]
+
+    def forward(self, seconds, t):
+        se = self._seconds_embed(seconds)[:, 0, :]            # [B,768]  (== DiTBaked gcond)
+        ge = self.to_global_embed(se)                         # [B,1536]
+        t_cond = self._logsnr(t) if self.use_logsnr else t
+        t_cond = t_cond.to(ge.dtype)
+        te = self.to_timestep_embed(self.timestep_features(t_cond[:, None]))   # [B,1536]
+        return self.gce(ge + te)                              # [B,9216]  (timestep_cond_type=="global")
+
+
+def apply_gce_outside(dit):
+    """Move the global-cond preproc OUT of the rung graph (it lives in GlobalCondBaked / gcond.tflite): the
+    rung then receives the pre-computed gc[1,9216] as `global_embed` and feeds it straight to the blocks'
+    adaLN. Keeps the 24x-inlined global_cond_embedder FC out of the int8 rung (the XNNPACK-cache corruption
+    trigger). _forward: to_global_embed=Identity -> global_embed stays = gc; timestep_cond_type!='global' ->
+    no timestep add; global_cond_embedder=None -> blocks get gc directly (see memory file)."""
+    dit.to_global_embed = nn.Identity()
+    dit.timestep_cond_type = "DISABLED"
+    dit.transformer.global_cond_embedder = None
+
+
 class DiTBaked(nn.Module):
     def __init__(self, dit, seccond, pad):
         super().__init__()
+        apply_gce_outside(dit)               # rung takes pre-computed gc[1,9216]; gce lives in gcond.tflite
         self.dit = dit
         self.seccond = seccond
         self.register_buffer("pad", pad)
@@ -155,15 +200,19 @@ class DiTBaked(nn.Module):
         emb = c.embedder(s)                            # NumberEmbedder -> [B, 768] (or [B,1,768])
         return emb if emb.dim() == 3 else emb.unsqueeze(1)   # [B,1,768]
 
-    def forward(self, x, t, t5_hidden, t5_mask, seconds, local_add_cond, attn_mask):
+    def forward(self, x, gc, t5_hidden, t5_mask, seconds, local_add_cond, attn_mask):
         _ADD_MASK[0] = attn_mask                                       # [B,1,1,MEM+R] additive self-attn key mask
         m = t5_mask[..., None]                                          # [B,256,1] float 0/1 (no bool cast -> no tfl.less)
         padded = t5_hidden * m + self.pad.view(1, 1, -1) * (1 - m)      # [B,256,768]  (== where(m,t5,pad))
-        se = self._seconds_embed(seconds)                              # [B,1,768]
+        se = self._seconds_embed(seconds)                              # [B,1,768]  (still needed for cross)
         cross = torch.cat([padded, se], dim=1)                         # [B,257,768]
-        gcond = se[:, 0, :]                                            # [B,768]
+        # gc[B,9216] is the pre-computed adaLN global (from gcond.tflite); dit mutated (apply_gce_outside) so
+        # _forward passes it straight to the blocks. t is dropped from the rung (it only fed timestep->global,
+        # now in gcond.tflite); a constant dummy keeps _forward's positional signature, its timestep_embed is
+        # unused (timestep_cond_type=="DISABLED") and constant-folds away.
+        dummy_t = x.new_full((x.shape[0],), 0.5)                       # [B]  (unused; prunes)
         return self.dit._forward(
-            x, t, cross_attn_cond=cross, global_embed=gcond,
+            x, dummy_t, cross_attn_cond=cross, global_embed=gc,
             local_add_cond=local_add_cond, padding_mask=None)
 
 
@@ -171,22 +220,54 @@ def _inputs(R, L=None, g=None):
     L = L or R
     g = torch.Generator().manual_seed(0) if g is None else g
     x = torch.randn(1, 256, R, generator=g)
+    gc = torch.randn(1, GCE_OUT, generator=g)                        # pre-computed adaLN global (gcond.tflite)
     t5 = torch.randn(1, 256, 768, generator=g)
     t5m = torch.ones(1, 256)
     lac = torch.randn(1, 257, R, generator=g)
     am = torch.zeros(1, 1, 1, MEM + R)
     am[..., MEM + L:] = -1e9                                          # mask the (R-L) pad keys
-    return (x, torch.tensor([0.5]), t5, t5m, torch.tensor([120.0]), lac, am)
+    return (x, gc, t5, t5m, torch.tensor([120.0]), lac, am)
+
+
+def _gcond_inputs(g=None):
+    return (torch.tensor([120.0]), torch.tensor([0.5]))              # (seconds, t) -> gc[1,9216]
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(); ap.add_argument("R", type=int); ap.add_argument("--verify", action="store_true")
+    ap = argparse.ArgumentParser(); ap.add_argument("R", type=int, nargs="?", default=0)
+    ap.add_argument("--verify", action="store_true")
     ap.add_argument("--probe", action="store_true")
+    ap.add_argument("--gcond", action="store_true", help="export gcond.tflite: (seconds,t) -> gc[1,9216]")
     a = ap.parse_args()
     patch_attention_for_export(debug=True)
     print("loading DiT + seconds from ARC checkpoint…", flush=True)
     dit, seccond, pad = load_model()
-    baked = DiTBaked(dit, seccond, pad).eval()
+
+    if a.gcond:                                   # the global-cond preamble (BEFORE any DiTBaked mutation)
+        gcb = GlobalCondBaked(dit, seccond).eval()
+        gsample = _gcond_inputs()
+        with torch.no_grad():
+            gfull = gcb(*gsample)
+        print(f"gcond forward out={tuple(gfull.shape)} OK", flush=True)
+        import ai_edge_torch
+        work = os.environ.get("SA3_BUILD_WORK", os.path.dirname(__file__))
+        os.makedirs(work, exist_ok=True)
+        out = os.path.join(work, "gcond.tflite")
+        print("converting gcond -> tflite …", flush=True)
+        ai_edge_torch.convert(gcb.eval(), gsample).export(out)
+        from ai_edge_litert.interpreter import Interpreter
+        it = Interpreter(model_path=out); it.allocate_tensors()
+        det = sorted(it.get_input_details(), key=lambda d: d["name"])   # args_0=seconds, args_1=t
+        for d_, arr in zip(det, gsample):
+            it.set_tensor(d_["index"], arr.numpy().astype(d_["dtype"]))
+        it.invoke()
+        tfl = it.get_tensor(it.get_output_details()[0]["index"])
+        err = float((torch.from_numpy(tfl) - gfull).abs().max())
+        print(f"EXPORTED gcond -> {out} ({os.path.getsize(out)/1e6:.0f}MB)  tflite-vs-torch max|d|={err:.2e} "
+              f"{'OK' if err < 1e-2 else 'CHECK'}", flush=True)
+        print("DONE", flush=True); sys.exit(0)
+
+    baked = DiTBaked(dit, seccond, pad).eval()    # NOTE: mutates dit (apply_gce_outside) — do gcond FIRST
     with torch.no_grad():
         full = baked(*_inputs(a.R))
         print(f"R={a.R} baked forward out={tuple(full.shape)} OK", flush=True)
@@ -195,13 +276,14 @@ if __name__ == "__main__":
             L = max(8, a.R // 2)
             gi = torch.Generator().manual_seed(1)
             xr = _inputs(a.R, L=L, g=torch.Generator().manual_seed(1))
-            # build a matching length-L input from the same seed-1 draw (first L of x / lac)
+            # build a matching length-L input from the same seed-1 draw (draw order == _inputs: x, gc, t5, lac)
             gL = torch.Generator().manual_seed(1)
             xL = torch.randn(1, 256, a.R, generator=gL)[:, :, :L]
+            gcL = torch.randn(1, GCE_OUT, generator=gL)                   # gc is length-independent (same draw)
             t5L = torch.randn(1, 256, 768, generator=gL)
             lacL = torch.randn(1, 257, a.R, generator=gL)[:, :, :L]
             amL = torch.zeros(1, 1, 1, MEM + L)
-            ref = baked(xL, torch.tensor([0.5]), t5L, torch.ones(1, 256), torch.tensor([120.0]), lacL, amL)
+            ref = baked(xL, gcL, t5L, torch.ones(1, 256), torch.tensor([120.0]), lacL, amL)
             got = baked(*xr)[:, :, :L]
             d = (ref - got).abs().max().item()
             print(f"MASK CHECK R={a.R} L={L}: max|rungR[:L] - plainL| = {d:.2e}  {'OK' if d < 1e-3 else 'MISMATCH'}", flush=True)
@@ -228,6 +310,7 @@ if __name__ == "__main__":
     if not a.verify and not a.probe:
         import ai_edge_torch
         work = os.environ.get("SA3_BUILD_WORK", os.path.dirname(__file__))
+        os.makedirs(work, exist_ok=True)
         out = os.path.join(work, f"dit_fp32_{a.R}.tflite")
         sample = _inputs(a.R)
         print(f"converting R={a.R} -> tflite …", flush=True)

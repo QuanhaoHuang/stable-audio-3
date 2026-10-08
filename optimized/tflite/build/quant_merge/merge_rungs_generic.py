@@ -104,6 +104,19 @@ sig_defs = [mk_sig(f"s{RUNGS[0]}", base.subgraphs[0], 0, base_sig0)]
 for r in RUNGS[1:]:
     idx, sg, add_sig = add_subgraph(str(WORK / f"{PREFIX}{r}{SUFFIX}.tflite"))
     sig_defs.append(mk_sig(f"s{r}", sg, idx, add_sig))
+# Fold in extra NAMED subgraphs (SA3_MERGE_EXTRA="key:path[,key2:path2]"); path relative to WORK unless
+# absolute. Used to bundle the DiT's global-cond preamble as a `gcond` signature in the same .tflite (one
+# shipped file). Its buffers dedup like any other — they're unique (fp32, not in the int8/fp32 rungs) so they
+# land once; a single non-shared subgraph is cache-safe (the cache bug needs a weight shared across >=2 rungs).
+for spec in os.environ.get("SA3_MERGE_EXTRA", "").split(","):
+    spec = spec.strip()
+    if not spec:
+        continue
+    key, pth = spec.split(":", 1)
+    pth = pth if os.path.isabs(pth) else str(WORK / pth)
+    idx, sg, add_sig = add_subgraph(pth)
+    sig_defs.append(mk_sig(key, sg, idx, add_sig))
+    print(f"  + folded extra subgraph '{key}' <- {os.path.basename(pth)}")
 base.signatureDefs = sig_defs
 
 out = WORK / OUT
